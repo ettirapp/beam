@@ -20,14 +20,10 @@ package org.apache.beam.sdk.io.azure.blobstore;
 import static java.util.UUID.randomUUID;
 import static org.apache.beam.sdk.io.fs.CreateOptions.StandardCreateOptions.builder;
 import static org.hamcrest.Matchers.contains;
-import static org.junit.Assert.assertArrayEquals;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertThat;
+import static org.junit.Assert.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.azure.core.http.rest.PagedIterable;
@@ -40,6 +36,8 @@ import com.azure.storage.blob.models.ListBlobsOptions;
 import com.azure.storage.blob.specialized.BlobInputStream;
 import com.azure.storage.blob.specialized.BlobOutputStream;
 import com.azure.storage.blob.specialized.BlockBlobClient;
+import java.io.File;
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.ReadableByteChannel;
@@ -47,15 +45,15 @@ import java.nio.channels.WritableByteChannel;
 import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
-import java.util.Arrays;
+import java.util.Collection;
 import java.util.List;
 import org.apache.beam.sdk.io.azure.options.BlobstoreOptions;
 import org.apache.beam.sdk.io.fs.MatchResult;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.FluentIterable;
 import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.collect.ImmutableList;
+import org.apache.commons.io.FileUtils;
 import org.junit.Before;
-import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
@@ -144,48 +142,109 @@ public class AzureBlobStoreFileSystemTest {
   }
 
   @Test
-  @SuppressWarnings("CheckReturnValue")
+  public void testDelete() throws IOException {
+    String containerName = "test-container" + randomUUID();
+    String blobName1 = "blob" + randomUUID();
+    String blobName2 = "dir1/anotherBlob" + randomUUID();
+
+    // Create files to delete
+    BlobContainerClient blobContainerClient =
+        azureBlobStoreFileSystem.getClient().createBlobContainer(containerName);
+    assertTrue(blobContainerClient.exists());
+    blobContainerClient.getBlobClient(blobName1).uploadFromFile("src/test/resources/in.txt");
+    blobContainerClient.getBlobClient(blobName2).uploadFromFile("src/test/resources/in.txt");
+    assertTrue(blobContainerClient.getBlobClient(blobName1).exists());
+    assertTrue(blobContainerClient.getBlobClient(blobName2).exists());
+
+    // Delete the files
+    Collection<AzfsResourceId> toDelete = new ArrayList<>();
+    String account = blobContainerClient.getAccountName();
+    // delete blob
+    toDelete.add(AzfsResourceId.fromComponents(account, containerName, blobName1));
+    // delete directory
+    toDelete.add(AzfsResourceId.fromComponents(account, containerName, "dir1/"));
+    azureBlobStoreFileSystem.delete(toDelete);
+
+    // Ensure exception is thrown, clean up
+    assertFalse(blobContainerClient.getBlobClient(blobName1).exists());
+    assertFalse(blobContainerClient.getBlobClient(blobName2).exists());
+    assertThrows(FileNotFoundException.class, () -> azureBlobStoreFileSystem.delete(toDelete));
+    blobContainerClient.delete();
+  }
+
+  @Test
   public void testCopy() throws IOException {
-    List<AzfsResourceId> src =
-        new ArrayList<>(
-            Arrays.asList(AzfsResourceId.fromComponents("account", "container", "from")));
-    List<AzfsResourceId> dest =
-        new ArrayList<>(Arrays.asList(AzfsResourceId.fromComponents("account", "container", "to")));
-    when(mockedBlobClient.exists()).thenReturn(true);
+    BlobServiceClient blobServiceClient = azureBlobStoreFileSystem.getClient();
+    String account = blobServiceClient.getAccountName();
+
+    List<AzfsResourceId> src = new ArrayList<>();
+    List<AzfsResourceId> dest = new ArrayList<>();
+    String srcContainer = "source-container" + randomUUID();
+    String destContainer = "dest-container" + randomUUID();
+
+    // Create source file
+    BlobContainerClient srcContainerClient = blobServiceClient.createBlobContainer(srcContainer);
+    srcContainerClient.getBlobClient("src-blob").uploadFromFile("src/test/resources/in.txt");
+
+    // Copy source file to destination
+    src.add(AzfsResourceId.fromComponents(account, srcContainer, "src-blob"));
+    dest.add(AzfsResourceId.fromComponents(account, destContainer, "dest-blob"));
     azureBlobStoreFileSystem.copy(src, dest);
-    verify(mockedBlobClient, times(1)).copyFromUrl(any(String.class));
+
+    // Confirm the destination container was created
+    BlobContainerClient destContainerClient =
+        blobServiceClient.getBlobContainerClient(destContainer);
+    assertTrue(destContainerClient.getBlobClient("dest-blob").exists());
+
+    // Confirm that the source and destination files are the same
+    srcContainerClient.getBlobClient("src-blob").downloadToFile("./src/test/resources/blob1");
+    destContainerClient.getBlobClient("dest-blob").downloadToFile("./src/test/resources/blob2");
+    File file1 = new File("./src/test/resources/blob1");
+    File file2 = new File("./src/test/resources/blob2");
+    assertTrue("The files differ!", FileUtils.contentEquals(file1, file2));
+
+    // Clean up
+    assertTrue(file1.delete());
+    assertTrue(file2.delete());
+    blobServiceClient.deleteBlobContainer(srcContainer);
+    blobServiceClient.deleteBlobContainer(destContainer);
   }
 
   @Test
   public void testWriteAndRead() throws IOException {
-    azureBlobStoreFileSystem.getClient().createBlobContainer("testcontainer");
+    BlobServiceClient client = azureBlobStoreFileSystem.getClient();
+    String containerName = "test-container" + randomUUID();
+    client.createBlobContainer(containerName);
 
     byte[] writtenArray = new byte[] {0};
     ByteBuffer bb = ByteBuffer.allocate(writtenArray.length);
     bb.put(writtenArray);
 
-    // First create an object and write data to it
-    AzfsResourceId path = AzfsResourceId.fromUri("azfs://account/testcontainer/foo/bar.txt");
+    // Create an object and write data to it
+    AzfsResourceId path =
+        AzfsResourceId.fromUri(
+            "azfs://" + client.getAccountName() + "/" + containerName + "/foo/bar.txt");
     WritableByteChannel writableByteChannel =
         azureBlobStoreFileSystem.create(path, builder().setMimeType("application/text").build());
     writableByteChannel.write(bb);
     writableByteChannel.close();
 
-    // Now read the same object
+    // Read the same object
     ByteBuffer bb2 = ByteBuffer.allocate(writtenArray.length);
     ReadableByteChannel open = azureBlobStoreFileSystem.open(path);
     open.read(bb2);
 
-    // And compare the content with the one that was written
+    // Compare the content with the one that was written
     byte[] readArray = bb2.array();
     assertArrayEquals(readArray, writtenArray);
     open.close();
+
+    // Clean up
+    client.getBlobContainerClient(containerName).delete();
   }
 
   @Test
-  @Ignore
   public void testGlobExpansion() throws IOException {
-    // TODO: Write this test with mocks - see GcsFileSystemTest
     String container = "test-container" + randomUUID();
     BlobContainerClient blobContainerClient =
         azureBlobStoreFileSystem.getClient().createBlobContainer(container);
@@ -266,9 +325,7 @@ public class AzureBlobStoreFileSystemTest {
   }
 
   @Test
-  @Ignore
   public void testMatch() throws Exception {
-    // TODO: Write this test with mocks - see GcsFileSystemTest
     String container = "test-container" + randomUUID();
     BlobContainerClient blobContainerClient =
         azureBlobStoreFileSystem.getClient().createBlobContainer(container);
@@ -313,7 +370,6 @@ public class AzureBlobStoreFileSystemTest {
 
   @Test
   public void testMatchNonGlobs() throws Exception {
-    // TODO: Write this test with mocks - see GcsFileSystemTest
     String container = "test-container" + randomUUID();
     BlobContainerClient blobContainerClient =
         azureBlobStoreFileSystem.getClient().createBlobContainer(container);
